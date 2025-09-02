@@ -1,117 +1,109 @@
-# =========================
-# FILE: vlm/sync_api.py
-# =========================
-# 使用 Ollama 的 Qwen 2.5-VL 做整潔度評分（0~1）
-#   先拉模型：  ollama pull qwen2.5vl
-#   預設端點：  http://localhost:11434/api/chat
+"""
+Synchronous VLM client (Ollama)
+- Minimal deps (urllib + Pillow). No streaming.
+- Works with vision models like qwen2.5-vl / qwen3-vl.
+
+Usage:
+    from vlm.sync_api import score_image
+    s = score_image(np_image, prompt="Rate tidiness 0..1 only")
+
+Env vars (optional):
+    OLLAMA_HOST  : default "http://localhost:11434"
+    OLLAMA_VLM   : default "qwen2.5-vl"
+"""
 from __future__ import annotations
-import base64, json, re
+
+import base64
+import io
+import json
+import os
+import re
+import urllib.request
 from typing import Optional
 
-import cv2
 import numpy as np
-import requests
-import os
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
-DEFAULT_MODEL = os.environ.get("OLLAMA_VLM", "qwen2.5vl")
-
-JUDGE_PROMPT = (
-    "You are a strict desk-tidiness judge.\n"
-    "Score how tidy this tabletop arrangement is considering: alignment to a straight line, "
-    "even spacing, no overlaps, and objects placed within the table area.\n"
-    'Return ONLY JSON: {"score": float in [0,1], "reason": "one sentence"}'
-)
+try:
+    from PIL import Image
+    _PIL_OK = True
+except Exception:  # pragma: no cover
+    _PIL_OK = False
 
 
-def _img_to_b64(img_bgr: np.ndarray) -> str:
-    if img_bgr is None:
-        raise ValueError("img_bgr is None")
-    ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise RuntimeError("cv2.imencode failed")
-    return base64.b64encode(buf.tobytes()).decode()
+def _np_to_png_b64(img: np.ndarray) -> Optional[str]:
+    if not _PIL_OK:
+        return None
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+    if img.ndim == 2:
+        mode = "L"
+    elif img.ndim == 3 and img.shape[2] == 3:
+        mode = "RGB"
+    elif img.ndim == 3 and img.shape[2] == 4:
+        mode = "RGBA"
+    else:
+        raise ValueError(f"Unsupported image shape: {img.shape}")
+    im = Image.fromarray(img, mode=mode)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    b = base64.b64encode(buf.getvalue()).decode("ascii")
+    return b
 
 
-def get_vlm_score(
-    img_bgr: np.ndarray,
-    model: str = DEFAULT_MODEL,
-    prompt: str = JUDGE_PROMPT,
-    timeout_s: int = 45,
-) -> float:
-    """回傳 0~1 的整潔度分數。若呼叫失敗則回 0.0。"""
-    b64 = _img_to_b64(img_bgr)
+def _post_json(url: str, payload: dict, timeout: float = 30.0) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"response": raw}
+
+
+def _extract_float(text: str, lo: float = 0.0, hi: float = 1.0) -> Optional[float]:
+    # find first float-like token in text
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        v = float(m.group(0))
+    except Exception:
+        return None
+    return float(max(lo, min(hi, v)))
+
+
+def score_image(
+    image_np: np.ndarray,
+    *,
+    prompt: str = (
+        "You are a tidy desk judge. Score how tidy this tabletop arrangement looks. "
+        "Return a single number from 0 to 1 where 1=very tidy, 0=very messy. Output only the number."
+    ),
+    host: Optional[str] = None,
+    model: Optional[str] = None,
+    timeout: float = 45.0,
+) -> Optional[float]:
+    """Return a scalar score in [0,1] from a VLM via Ollama. None on failure."""
+    host = host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    model = model or os.getenv("OLLAMA_VLM", "qwen2.5-vl")
+
+    b64 = _np_to_png_b64(image_np)
+    if b64 is None:
+        return None
+
     payload = {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": prompt,
-            "images": [b64],
-        }],
-        "options": {"temperature": 0},
-        # 讓模型以 JSON schema 格式化輸出（Ollama 支援 format）
-        "format": {
-            "type": "object",
-            "properties": {
-                "score": {"type": "number"},
-                "reason": {"type": "string"},
-            },
-            "required": ["score", "reason"],
-        },
-    }
-
-    content: Optional[str] = None
-    try:
-        r = requests.post(OLLAMA_URL, json=payload, timeout=timeout_s)
-        r.raise_for_status()
-        content = r.json().get("message", {}).get("content", "{}")
-        data = json.loads(content)
-        s = float(data.get("score", 0.0))
-        return max(0.0, min(1.0, s))
-    except Exception:
-        # 後備：嘗試從回傳文字抓第一個小數
-        if content:
-            m = re.search(r"([0]?\.?\d+)", content)
-            if m:
-                try:
-                    s = float(m.group(1))
-                    return max(0.0, min(1.0, s))
-                except Exception:
-                    pass
-        return 0.0
-
-
-# （可選）雙圖偏好，用於收集少量偏好資料或做評比
-PAIR_PROMPT = (
-    "You will see two images A and B of the same tabletop at different times.\n"
-    "Choose which one looks tidier overall based on: alignment to a straight line, even spacing, "
-    "no overlaps, and staying within the table area.\n"
-    'Return ONLY JSON: {"winner": "A" or "B", "reason": "one sentence"}'
-)
-
-def pairwise_preference(imgA_bgr: np.ndarray, imgB_bgr: np.ndarray,
-                        model: str = DEFAULT_MODEL,
-                        timeout_s: int = 45) -> int:
-    b64A = _img_to_b64(imgA_bgr)
-    b64B = _img_to_b64(imgB_bgr)
-    payload = {
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": PAIR_PROMPT,
-            "images": [b64A, b64B],
-        }],
-        "options": {"temperature": 0},
-        "format": {
-            "type": "object",
-            "properties": {"winner": {"type": "string"}, "reason": {"type": "string"}},
-            "required": ["winner", "reason"],
-        },
+        "prompt": prompt,
+        "images": [b64],  # vision models accept images[]
+        "stream": False,
+        # temperature left default for determinism
     }
     try:
-        r = requests.post(OLLAMA_URL, json=payload, timeout=timeout_s)
-        r.raise_for_status()
-        data = json.loads(r.json().get("message", {}).get("content", "{}"))
-        return +1 if str(data.get("winner", "A")).upper() == "A" else -1
+        res = _post_json(host.rstrip("/") + "/api/generate", payload, timeout=timeout)
     except Exception:
-        return 0
+        return None
+
+    text = (res.get("response") or "").strip()
+    val = _extract_float(text, 0.0, 1.0)
+    return val

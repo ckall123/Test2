@@ -1,242 +1,275 @@
-# object/spawner.py
-import uuid
-import random
+"""
+Gazebo Object Spawner (ROS2) — v2
+---------------------------------
+功能：
+- 透過 Gazebo 的 `/spawn_entity`、`/delete_entity`、`/get_model_list` 服務，將物件 (URDF/SDF/XML字串/檔案) spawn 進世界
+- 提供「不重疊」的桌面隨機擺放：在 `table_area` 內根據半徑 `radius` 迴避重疊與邊界
+- 回傳 spawn 結果（名稱、姿態、半徑），方便在 `reset()` 時放進 `info`
+
+設計重點：
+- 不跟 wrapper 合併；單純專注在 spawn / delete / list 與簡單 layout 規劃
+- 命名若重複，會自動加後綴 `_1`, `_2`, ...
+- 支援從檔案讀取（.urdf / .sdf / .xml），或直接給 XML 字串
+
+需求：
+- 服務存在：/spawn_entity, /delete_entity, /get_model_list
+  (你的環境清單已包含這三個服務)
+
+用法範例：
+```python
+from objects.spawner import Spawner, SpawnerConfig, TableArea, ModelSpec
+
+sp = Spawner(SpawnerConfig(table_area=TableArea(xmin=-0.3, xmax=0.3, ymin=0.2, ymax=0.8, z=0.76)))
+sp.wait_until_ready()
+
+specs = [
+    ModelSpec(name="cube", file_path="/home/user/models/cube.urdf", fmt="urdf", radius=0.035),
+    ModelSpec(name="mug",  file_path="/home/user/models/mug.sdf",  fmt="sdf",  radius=0.045),
+]
+spawned = sp.spawn_batch(specs, randomize=True, seed=42)
+# spawned -> list of SpawnedModel(name, xyzrpy=(x,y,z,roll,pitch,yaw), radius)
+```
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Iterable
+import os
+import time
+
 import numpy as np
+
 import rclpy
 from rclpy.node import Node
-from gazebo_msgs.srv import SpawnEntity, DeleteEntity
-from typing import List, Tuple, Optional
 
-# -------------------------------------------------
-# 桌面生成範圍（與 TABLE_BOUNDS 對齊）
-# -------------------------------------------------
-# X_RANGE = [-0.75, 0.75]
-# Y_RANGE = [-0.40, 0.40]
-
-X_RANGE = [-1.05, 0.45]
-Y_RANGE = [-1.20, -0.40]
-Z_HEIGHT = 1.015  # 物件 z 放在桌面高度，按需微調
+# Gazebo services
+from geometry_msgs.msg import Pose, Point, Quaternion
+from gazebo_msgs.srv import SpawnEntity, DeleteEntity, GetModelList
 
 
-# 手臂佔用區域（避免在此生成）
-# Arm_X_RANGE = (-0.05, 0.257)
-# Arm_Y_RANGE = (-0.116, 0.116)
-# Arm_Z_RANGE = (-0.05, 0.601)
+# ----------------------------- Data -----------------------------
 
-Arm_X_RANGE = (-0.45, -0.11)
-Arm_Y_RANGE = (-0.67, -0.26)
-Arm_Z_RANGE = (1.01, 1.616)
+@dataclass
+class TableArea:
+    xmin: float
+    xmax: float
+    ymin: float
+    ymax: float
+    z: float  # table top Z for placing objects (object base contact)
 
-# 可供生成的模型名稱（預設改為空，請在建構時或呼叫時提供）
-DEFAULT_OBJECT_NAMES = ["beer", "bowl", "wood_cube_2_5cm", "wood_cube_5cm", "wood_cube_7_5cm"]
+    def contains(self, x: float, y: float, margin: float = 0.0) -> bool:
+        return (self.xmin + margin <= x <= self.xmax - margin) and (self.ymin + margin <= y <= self.ymax - margin)
 
+
+@dataclass
+class SpawnerConfig:
+    table_area: TableArea
+    name_prefix: str = "obj"
+    max_spawn_tries: int = 200
+    separation_margin: float = 0.01  # extra distance added on top of (r_i + r_j)
+    default_roll_pitch: Tuple[float, float] = (0.0, 0.0)
+    default_yaw_range: Tuple[float, float] = (-np.pi, np.pi)
+    reference_frame: str = "world"
+    wait_timeout: float = 3.0
+
+
+@dataclass
+class ModelSpec:
+    name: str
+    # 一下兩者擇一
+    xml: Optional[str] = None      # 直接給 XML 字串（URDF/SDF）
+    file_path: Optional[str] = None  # 從檔案讀（支援 .urdf / .sdf / .xml）
+    fmt: str = "sdf"              # "urdf" 或 "sdf"，僅用於註記與除錯
+    radius: float = 0.04           # 約略圓盤半徑（用於避免重疊）
+    z_offset: float = 0.0          # 物件自身模型原點到桌面的高度偏移（需要時填）
+    yaw_random: bool = True
+    yaw_range: Optional[Tuple[float, float]] = None  # 若不給，採用 config.default_yaw_range
+
+
+@dataclass
+class SpawnedModel:
+    name: str
+    xyzrpy: Tuple[float, float, float, float, float, float]
+    radius: float
+
+
+# ----------------------------- Spawner -----------------------------
 
 class Spawner(Node):
-    """Gazebo Entity Spawner（隨機版）
+    def __init__(self, cfg: SpawnerConfig):
+        super().__init__("tabletop_spawner")
+        self.cfg = cfg
+        self._cli_spawn = self.create_client(SpawnEntity, "/spawn_entity")
+        self._cli_delete = self.create_client(DeleteEntity, "/delete_entity")
+        self._cli_list = self.create_client(GetModelList, "/get_model_list")
 
-    只提供隨機生成 API：`spawn_random_objects`。
-    - 不再公開 `spawn_object`。
-    - 你只需要提供：
-        1) 要生成的數量 `count`
-        2) 可被隨機挑選的模型清單 `candidates`（可選；若不給就用建構子傳入的 `object_names`）
-      並可選擇啟用 `strict_unique=True` 以保證「同一個 base model 不重複」。
-    - 自動避開手臂 XY 投影區域，並盡量避免物件彼此太近。
-    """
+    # -- lifecycle -----------------------------------------------------
+    def wait_until_ready(self) -> bool:
+        ok1 = self._cli_spawn.wait_for_service(timeout_sec=self.cfg.wait_timeout)
+        ok2 = self._cli_delete.wait_for_service(timeout_sec=self.cfg.wait_timeout)
+        ok3 = self._cli_list.wait_for_service(timeout_sec=self.cfg.wait_timeout)
+        if not (ok1 and ok2 and ok3):
+            self.get_logger().warn("Spawner services not all available.")
+        return ok1 and ok2 and ok3
 
-    def __init__(self,
-                 *,
-                 arm_bounds: dict | None = None,
-                 object_names: Optional[List[str]] = None,
-                 node_name: Optional[str] = None):
-        node_name = node_name or f"spawner_node_{uuid.uuid4().hex[:8]}"
-        super().__init__(node_name)
+    # -- model list / delete ------------------------------------------
+    def list_models(self) -> List[str]:
+        fut = self._cli_list.call_async(GetModelList.Request())
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=self.cfg.wait_timeout)
+        res = fut.result()
+        return list(res.model_names) if res is not None else []
 
-        self.spawn_cli = self.create_client(SpawnEntity, '/spawn_entity')
-        self.delete_cli = self.create_client(DeleteEntity, '/delete_entity')
-
-        self.arm_bounds = arm_bounds or {
-            'x': Arm_X_RANGE,
-            'y': Arm_Y_RANGE,
-            'z': Arm_Z_RANGE,
-        }
-
-        # 使用者自己提供的 object 名單；若未提供則為空清單
-        self.object_names = list(object_names) if object_names else list(DEFAULT_OBJECT_NAMES)
-        if not self.object_names:
-            self.get_logger().warn("No object_names provided; you must pass candidates to spawn_random_objects().")
-
-        # 記錄目前 spawn 的 instance name（用來 delete_all）
-        self.spawned_names: List[str] = []
-
-        # 服務等待（短暫重試）
-        for _ in range(5):
-            if self.spawn_cli.wait_for_service(timeout_sec=1.0) and \
-               self.delete_cli.wait_for_service(timeout_sec=1.0):
-                break
-
-    # ---------- 刪除相關 ----------
-    def delete_object(self, name: str, timeout: float = 8.0) -> bool:
+    def delete(self, name: str) -> bool:
         req = DeleteEntity.Request()
         req.name = name
-        future = self.delete_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
-        # 若 delete 成功或已刪除，移出 spawned_names
-        if name in self.spawned_names:
-            try:
-                self.spawned_names.remove(name)
-            except ValueError:
-                pass
-        return bool(future.done() and future.exception() is None)
+        fut = self._cli_delete.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=self.cfg.wait_timeout)
+        return fut.result() is not None
 
-    def delete_all(self, timeout: float = 3.0):
-        """嘗試刪除 self.spawned_names 的所有 instance（best-effort）"""
-        for n in list(self.spawned_names):
+    def delete_many(self, names: Iterable[str]) -> int:
+        cnt = 0
+        for n in names:
             try:
-                self.delete_object(n, timeout=timeout)
+                if self.delete(n):
+                    cnt += 1
             except Exception:
                 pass
-        self.spawned_names = []
+        return cnt
 
-    # ---------- 隨機生成相關 ----------
-    def get_safe_random_position(self, forbidden_positions: Optional[List[np.ndarray]] = None,
-                                 min_dist: float = 0.08, max_attempts: int = 100) -> np.ndarray:
-        """回傳 X/Y 在桌面內、且不落在手臂 XY 盒內的隨機 [x,y,z]，並盡量和 forbidden_positions 保持距離。"""
-        arm = self.arm_bounds
-        x0, x1 = X_RANGE
-        y0, y1 = Y_RANGE
-        forbidden_positions = forbidden_positions or []
+    # -- spawn core ----------------------------------------------------
+    def spawn(self, name: str, xml: str, xyzrpy: Tuple[float, float, float, float, float, float]) -> bool:
+        x, y, z, r, p, yaw = xyzrpy
+        pose = Pose()
+        pose.position = Point(x=float(x), y=float(y), z=float(z))
+        # convert rpy -> quaternion (ZYX yaw-pitch-roll)
+        qx, qy, qz, qw = self._rpy_to_quat(r, p, yaw)
+        pose.orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
 
-        for _ in range(max_attempts):
-            x = random.uniform(x0, x1)
-            y = random.uniform(y0, y1)
-            if arm is not None and (arm['x'][0] <= x <= arm['x'][1] and arm['y'][0] <= y <= arm['y'][1]):
+        # resolve duplicate names
+        name_final = self._resolve_unique_name(name)
+
+        req = SpawnEntity.Request()
+        req.name = name_final
+        req.xml = xml
+        req.robot_namespace = ""
+        req.initial_pose = pose
+        req.reference_frame = self.cfg.reference_frame
+
+        fut = self._cli_spawn.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=self.cfg.wait_timeout)
+        ok = fut.result() is not None
+        if not ok:
+            self.get_logger().warn(f"spawn failed: {name_final}")
+        return ok
+
+    # -- batch with layout --------------------------------------------
+    def spawn_batch(self, specs: List[ModelSpec], randomize: bool = True, seed: Optional[int] = None) -> List[SpawnedModel]:
+        rng = np.random.default_rng(seed if seed is not None else int(time.time() * 1000) & 0xFFFFFFFF)
+        placed: List[Tuple[float, float, float]] = []  # (x, y, radius)
+        out: List[SpawnedModel] = []
+
+        for spec in specs:
+            # resolve XML
+            xml = self._resolve_xml(spec)
+            if xml is None:
+                self.get_logger().warn(f"skip spec without xml: {spec.name}")
                 continue
-            candidate = np.array([x, y, Z_HEIGHT], dtype=np.float32)
-            # 距離檢查
+
+            # sample layout
+            if randomize:
+                xy = self._sample_xy_nonoverlap(rng, spec.radius, placed)
+            else:
+                # deterministic center drop (best-effort)
+                cx = 0.5 * (self.cfg.table_area.xmin + self.cfg.table_area.xmax)
+                cy = 0.5 * (self.cfg.table_area.ymin + self.cfg.table_area.ymax)
+                xy = np.array([cx, cy], dtype=np.float32)
+
+            yaw = self._sample_yaw(rng, spec) if spec.yaw_random else 0.0
+            roll, pitch = self.cfg.default_roll_pitch
+            z = self.cfg.table_area.z + spec.z_offset
+            xyzrpy = (float(xy[0]), float(xy[1]), float(z), float(roll), float(pitch), float(yaw))
+
+            ok = self.spawn(spec.name, xml, xyzrpy)
+            if ok:
+                placed.append((float(xy[0]), float(xy[1]), float(spec.radius)))
+                out.append(SpawnedModel(name=self._resolve_latest_name(spec.name), xyzrpy=xyzrpy, radius=float(spec.radius)))
+        return out
+
+    # ---------------------------- helpers ----------------------------
+    def _resolve_xml(self, spec: ModelSpec) -> Optional[str]:
+        if spec.xml is not None and spec.xml.strip():
+            return spec.xml
+        if spec.file_path is None:
+            return None
+        path = os.path.expanduser(spec.file_path)
+        if not os.path.isfile(path):
+            # 允許非本機路徑（如 package://），交給 Gazebo 處理；這裡直接當作 xml 字串載入不行，回傳 None
+            # 若你有 xacro，請先外部轉換成 urdf 再給進來
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                return None
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def _sample_yaw(self, rng: np.random.Generator, spec: ModelSpec) -> float:
+        lo, hi = spec.yaw_range if spec.yaw_range is not None else self.cfg.default_yaw_range
+        return float(rng.uniform(lo, hi))
+
+    def _sample_xy_nonoverlap(self, rng: np.random.Generator, radius: float, placed: List[Tuple[float, float, float]]) -> np.ndarray:
+        ar = self.cfg.table_area
+        tries = 0
+        margin = float(radius + self.cfg.separation_margin)
+        while tries < self.cfg.max_spawn_tries:
+            x = float(rng.uniform(ar.xmin + margin, ar.xmax - margin))
+            y = float(rng.uniform(ar.ymin + margin, ar.ymax - margin))
+            if not ar.contains(x, y, margin=margin):
+                tries += 1
+                continue
             ok = True
-            for p in forbidden_positions:
-                if np.linalg.norm(candidate[:2] - np.asarray(p)[:2]) < min_dist:
+            for (px, py, pr) in placed:
+                d = float(np.hypot(x - px, y - py))
+                if d < (margin + pr):
                     ok = False
                     break
             if ok:
-                return candidate
-        # fallback：左下角
-        return np.array([x0, y0, Z_HEIGHT], dtype=np.float32)
+                return np.array([x, y], dtype=np.float32)
+            tries += 1
+        # fallback：放中間（可能重疊，之後靠 RL 自行解決）
+        cx = 0.5 * (ar.xmin + ar.xmax)
+        cy = 0.5 * (ar.ymin + ar.ymax)
+        return np.array([cx, cy], dtype=np.float32)
 
-    def spawn_random_objects(self,
-                             count: int,
-                             *,
-                             candidates: Optional[List[str]] = None,
-                             avoid_overlap_dist: float = 0.08,
-                             max_attempts_total: int = 500,
-                             strict_unique: bool = True,
-                             name_prefix: Optional[str] = None,
-                             timeout: float = 10.0) -> List[Tuple[str, np.ndarray]]:
-        """隨機 spawn 多個物件，無需手動指定位置。
+    def _rpy_to_quat(self, roll: float, pitch: float, yaw: float) -> Tuple[float, float, float, float]:
+        cr = np.cos(roll * 0.5); sr = np.sin(roll * 0.5)
+        cp = np.cos(pitch * 0.5); sp = np.sin(pitch * 0.5)
+        cy = np.cos(yaw * 0.5); sy = np.sin(yaw * 0.5)
+        qw = cr*cp*cy + sr*sp*sy
+        qx = sr*cp*cy - cr*sp*sy
+        qy = cr*sp*cy + sr*cp*sy
+        qz = cr*cp*sy - sr*sp*cy
+        return float(qx), float(qy), float(qz), float(qw)
 
-        參數：
-            count: 需要生成的物件數量。
-            candidates: 可被隨機挑選的 base model 名稱清單（例如 ['mug','banana','coke_can']）。
-                        若為 None 則使用建構子傳入的 self.object_names。
-            avoid_overlap_dist: 盡量避免彼此距離小於此值（非嚴格）。
-            max_attempts_total: 為每個 base 嘗試的總上限（包含重試）。
-            strict_unique: 若 True，保證同一個 base model 只會被選一次（若 count 超過可用種類，會自動截斷到最大可用數量並給出警告）。
-            name_prefix: 生成的 instance name 前綴；未填則使用 base 名稱 + uuid 的形式。
-            timeout: 等待服務回應的秒數。
+    def _resolve_unique_name(self, base: str) -> str:
+        existing = set(self.list_models())
+        if base not in existing:
+            self._last_name = base
+            return base
+        i = 1
+        while f"{base}_{i}" in existing:
+            i += 1
+        self._last_name = f"{base}_{i}"
+        return self._last_name
 
-        回傳：[(instance_name, position), ...]（只包含 spawn 成功者）
-        """
-        if count <= 0:
-            return []
+    def _resolve_latest_name(self, base: str) -> str:
+        return getattr(self, "_last_name", base)
 
-        base_pool = list(candidates) if candidates is not None else list(self.object_names)
-        if not base_pool:
-            raise ValueError("No object names available. Provide candidates or set object_names in constructor.")
 
-        # 準備 base 名單
-        if strict_unique:
-            if count > len(base_pool):
-                self.get_logger().warn(
-                    f"count({count}) > unique candidates({len(base_pool)}); trimming to {len(base_pool)} to keep unique.")
-                count = len(base_pool)
-            bases = random.sample(base_pool, k=count)
-        else:
-            bases = [random.choice(base_pool) for _ in range(count)]
-
-        spawned: List[Tuple[str, np.ndarray]] = []
-        forbidden_positions: List[np.ndarray] = []
-        attempts = 0
-
-        for base in bases:
-            if attempts >= max_attempts_total:
-                break
-            attempts += 1
-            pos = self.get_safe_random_position(forbidden_positions=forbidden_positions, min_dist=avoid_overlap_dist)
-            inst_name = self._compose_instance_name(base, prefix=name_prefix)
-            ok = self._spawn_via_service(base, pos, inst_name=inst_name, timeout=timeout)
-            if ok:
-                spawned.append((inst_name, pos))
-                forbidden_positions.append(pos)
-            # 若失敗，允許幾次重試（換位置與名字）
-            retry = 0
-            while (not ok) and retry < 3 and attempts < max_attempts_total:
-                attempts += 1; retry += 1
-                pos = self.get_safe_random_position(forbidden_positions=forbidden_positions, min_dist=avoid_overlap_dist)
-                inst_name = self._compose_instance_name(base, prefix=name_prefix)
-                ok = self._spawn_via_service(base, pos, inst_name=inst_name, timeout=timeout)
-                if ok:
-                    spawned.append((inst_name, pos))
-                    forbidden_positions.append(pos)
-
-        return spawned
-
-    # ---------- 工具 ----------
-    def list_spawned(self) -> List[str]:
-        return list(self.spawned_names)
-
-    # ---------- 私有：真正呼叫 SpawnEntity 服務 ----------
-    def _compose_instance_name(self, base_name: str, prefix: Optional[str] = None) -> str:
-        short = uuid.uuid4().hex[:8]
-        if prefix:
-            return f"{prefix}_{base_name}_{short}"
-        return f"{base_name}_{short}"
-
-    def _spawn_via_service(self, base_name: str, position: np.ndarray, *, inst_name: Optional[str] = None,
-                           timeout: float = 10.0) -> bool:
-        pos = np.asarray(position).reshape(3,)
-        inst = inst_name or self._compose_instance_name(base_name)
-
-        req = SpawnEntity.Request()
-        req.name = inst
-        req.xml = f"""
-        <sdf version='1.6'>
-          <model name='{inst}'>
-            <include>
-              <uri>model://{base_name}</uri>
-            </include>
-          </model>
-        </sdf>
-        """
-        req.robot_namespace = inst
-        req.initial_pose.position.x = float(pos[0])
-        req.initial_pose.position.y = float(pos[1])
-        req.initial_pose.position.z = float(pos[2])
-        req.initial_pose.orientation.w = 1.0
-
-        future = self.spawn_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
-        ok = future.done() and future.exception() is None and getattr(future.result(), 'success', False)
-
-        if not ok:
-            # 若失敗：嘗試刪除已存在的同名（安全退路）再重試一次
-            try:
-                self.delete_object(inst)
-            except Exception:
-                pass
-            future = self.spawn_cli.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
-            ok = future.done() and future.exception() is None and getattr(future.result(), 'success', False)
-
-        if ok:
-            self.spawned_names.append(inst)
-        return bool(ok)
+__all__ = [
+    "TableArea",
+    "SpawnerConfig",
+    "ModelSpec",
+    "SpawnedModel",
+    "Spawner",
+]

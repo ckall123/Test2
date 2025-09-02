@@ -1,186 +1,311 @@
-# =========================
-# FILE: envs/_ros_helpers.py
-# =========================
+"""
+ROS helpers (v4)
+- Single rclpy.Node hosting:
+  • TF2 Buffer/Listener (spin_thread=True)
+  • /joint_states subscriber (cached)
+  • camera Image subscriber (auto-detect topic; cached)
+- Public helpers:
+  • get_link_pose(parent, child, rpy=True) -> np.ndarray | None
+  • get_gripper_position(joint_name='drive_joint', default=0.0) -> float
+  • get_joint_positions(names) -> np.ndarray | None
+  • get_image(timeout=0.5, fill_if_none=False) -> np.ndarray[H,W,3] | None
+  • attach()/detach() via gazebo link attacher services (optional)
+
+Notes:
+- Assumes rclpy.init() was called before constructing RosHelpers.
+- All methods are defensive: return None/False/defaults instead of raising.
+- Camera topic selection order: env var CAMERA_TOPIC > cfg.camera_topic > auto-detect
+  among ['/top_camera/image_raw', '/camera/image_raw'] or any sensor_msgs/msg/Image topic.
+"""
+from __future__ import annotations
+
+import os
+import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from rclpy.time import Time
-from rclpy.duration import Duration  # 修正：使用正確的 Duration 匯入
-
-from sensor_msgs.msg import JointState, Image
-from rcl_interfaces.msg import Log
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from geometry_msgs.msg import TransformStamped
-import tf2_ros
+from typing import Optional, Tuple, List
 
 import numpy as np
+import rclpy
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.time import Time
 
-try:
-    from cv_bridge import CvBridge
-    _HAS_BRIDGE = True
-except Exception:
-    _HAS_BRIDGE = False
+from tf2_ros import Buffer, TransformListener
+from sensor_msgs.msg import JointState, Image
 
+# Link attacher messages (optional)
 try:
-    import cv2
-    _HAS_CV2 = True
+    from linkattacher_msgs.srv import AttachLink, DetachLink  # type: ignore
+    _HAS_LINK_ATTACHER = True
 except Exception:
-    _HAS_CV2 = False
+    _HAS_LINK_ATTACHER = False
 
 
 @dataclass
-class TfPose:
-    xyz: np.ndarray
-    quat: np.ndarray
+class RosConfig:
+    attach_srv: str = '/ATTACHLINK'
+    detach_srv: str = '/DETACHLINK'
+    tf_cache_sec: float = 10.0
+    camera_topic: str = ''  # if empty, will auto-detect
 
 
-class RosHelpers:
-    """
-    ROS2 輔助工具：
-      - TF 查詢
-      - JointTrajectory 發佈（手臂/夾爪）
-      - /joint_states, /rosout, 相機影像訂閱
-      - 便捷存取：最新關節角、夾爪位置、影像、違規旗標
-    """
+class RosHelpers(Node):
+    def __init__(self, cfg: Optional[RosConfig] = None):
+        super().__init__('xarm6_rl_helpers_client')
+        self.cfg = cfg or RosConfig()
 
-    def __init__(
-        self,
-        node_name: str = "xarm6_rl_helpers",
-        arm_traj_topic: str = "/xarm6_traj_controller/joint_trajectory",
-        grip_traj_topic: str = "/xarm_gripper_controller/joint_trajectory",
-        joint_names: Optional[List[str]] = None,
-        gripper_joint_name: str = "drive_joint",
-        camera_topic: Optional[str] = None,
-        image_size: Tuple[int, int] = (224, 224),
-    ):
-        if not rclpy.ok():
-            rclpy.init()
-        self.node: Node = rclpy.create_node(node_name)
+        # --- TF2 ---
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
-        # ---- TF ----
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self.node)
+        # --- JointStates subscriber (cache latest) ---
+        self._joint_lock = threading.Lock()
+        self._joint_state: Optional[JointState] = None
+        self._joint_pos_map: dict[str, float] = {}
+        self._sub_js = self.create_subscription(JointState, '/joint_states', self._on_joint_state, 10)
 
-        # ---- Publishers ----
-        qos_pub = QoSProfile(depth=1)
-        self.arm_pub = self.node.create_publisher(JointTrajectory, arm_traj_topic, qos_pub)
-        self.grip_pub = self.node.create_publisher(JointTrajectory, grip_traj_topic, qos_pub)
+        # --- Image subscriber (lazy) ---
+        env_cam = os.environ.get('CAMERA_TOPIC', '').strip()
+        self._camera_topic = env_cam or (self.cfg.camera_topic or '')
+        self._img_lock = threading.Lock()
+        self._img_msg: Optional[Image] = None
+        self._img_np: Optional[np.ndarray] = None
+        self._img_hwh: Optional[Tuple[int, int, int]] = None  # (H,W,C)
+        self._sub_img = None  # type: ignore
 
-        # ---- Joint states ----
-        self.joint_state: Dict[str, float] = {}
-        qos_sub = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
-        self.node.create_subscription(JointState, "/joint_states", self._joint_cb, qos_sub)
+        # --- Link attacher clients (optional) ---
+        self._has_attacher = False
+        if _HAS_LINK_ATTACHER:
+            try:
+                self._cli_attach = self.create_client(AttachLink, self.cfg.attach_srv)
+                self._cli_detach = self.create_client(DetachLink, self.cfg.detach_srv)
+                self._has_attacher = True
+            except Exception:
+                self._has_attacher = False
 
-        # ---- rosout（抓 tolerance/違規）----
-        self.violation_flag = False
-        self.node.create_subscription(Log, "/rosout", self._rosout_cb, 10)
+    # ------------------------------------------------------------------
+    # Joint states
+    # ------------------------------------------------------------------
+    def _on_joint_state(self, msg: JointState) -> None:
+        with self._joint_lock:
+            self._joint_state = msg
+            try:
+                self._joint_pos_map = {n: float(p) for n, p in zip(msg.name, msg.position)}
+            except Exception:
+                pass
 
-        # ---- image ----
-        self.camera_topic = camera_topic
-        self._image_w, self._image_h = image_size
-        self._bridge = CvBridge() if _HAS_BRIDGE else None
-        self._last_image: Optional[np.ndarray] = None
-        if camera_topic:
-            self.node.create_subscription(Image, camera_topic, self._image_cb, qos_sub)
+    def wait_for_joint_states(self, timeout: float = 1.5) -> bool:
+        deadline = self.get_clock().now() + Duration(seconds=float(timeout))
+        while rclpy.ok() and self.get_clock().now() < deadline:
+            if self._joint_state is not None:
+                return True
+            rclpy.spin_once(self, timeout_sec=0.05)
+        return self._joint_state is not None
 
-        # ---- Names ----
-        self.joint_names = joint_names or [
-            "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"
-        ]
-        self.gripper_joint_name = gripper_joint_name
+    def get_joint_positions(self, names: List[str]) -> Optional[np.ndarray]:
+        with self._joint_lock:
+            if not self._joint_pos_map:
+                return None
+            vals = []
+            for name in names:
+                v = self._joint_pos_map.get(name)
+                if v is None:
+                    return None
+                vals.append(float(v))
+            return np.array(vals, dtype=np.float32)
 
-    # --------- Callbacks ---------
-    def _joint_cb(self, msg: JointState):
-        try:
-            for name, pos in zip(msg.name, msg.position):
-                self.joint_state[name] = float(pos)
-        except Exception:
-            pass
+    def get_gripper_position(self, joint_name: str = 'drive_joint', default: float = 0.0) -> float:
+        with self._joint_lock:
+            if self._joint_pos_map and joint_name in self._joint_pos_map:
+                return float(self._joint_pos_map[joint_name])
+        # Try once to spin for fresh js
+        self.wait_for_joint_states(timeout=0.2)
+        with self._joint_lock:
+            return float(self._joint_pos_map.get(joint_name, default)) if self._joint_pos_map else float(default)
 
-    def _rosout_cb(self, msg: Log):
-        # 監看常見違規字樣：tolerance/limit/error/failure
-        s = (msg.msg or "").lower()
-        if any(k in s for k in [
-            "tolerance", "state tolerance", "goal tolerance", "out of range",
-            "limit", "exceeds", "violation", "failed", "failure", "unsafe"
-        ]):
-            self.violation_flag = True
-
-    def _image_cb(self, msg: Image):
-        if not self._bridge:
-            return
-        try:
-            cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            if _HAS_CV2:
-                cv_img = cv2.resize(cv_img, (self._image_w, self._image_h), interpolation=cv2.INTER_AREA)
-                cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-            else:
-                # 沒有 cv2 就只做 BGR→RGB
-                cv_img = cv_img[..., ::-1]
-            self._last_image = np.asarray(cv_img, dtype=np.uint8)
-        except Exception:
-            pass
-
-    # --------- Utilities ---------
-    def spin_once(self, timeout: float = 0.01):
-        rclpy.spin_once(self.node, timeout_sec=timeout)
-
-    def get_joint_positions(self) -> np.ndarray:
-        return np.array([self.joint_state.get(n, 0.0) for n in self.joint_names], dtype=np.float32)
-
-    def get_gripper_pos(self) -> float:
-        return float(self.joint_state.get(self.gripper_joint_name, 0.0))
-
-    def clear_violation(self):
-        self.violation_flag = False
-
-    def get_tf_pose(self, target_frame: str, source_frame: str = "world", timeout: float = 0.2) -> Optional[TfPose]:
-        try:
-            ts: TransformStamped = self.tf_buffer.lookup_transform(
-                source_frame, target_frame, Time(), Duration(seconds=timeout)
-            )
-            t = ts.transform.translation
-            q = ts.transform.rotation
-            return TfPose(
-                xyz=np.array([t.x, t.y, t.z], dtype=np.float32),
-                quat=np.array([q.x, q.y, q.z, q.w], dtype=np.float32),
-            )
-        except Exception:
+    # ------------------------------------------------------------------
+    # TF / poses
+    # ------------------------------------------------------------------
+    def get_link_pose(self, parent: str = 'link_base', child: str = 'link_tcp', *, rpy: bool = True, timeout: float = 0.5):
+        """Lookup transform parent→child from TF and return numpy array.
+        rpy=True → [x,y,z, roll,pitch,yaw] (len=6)
+        rpy=False → [x,y,z, qx,qy,qz,qw] (len=7)
+        Returns None if not available within timeout.
+        """
+        deadline = self.get_clock().now() + Duration(seconds=float(timeout))
+        tf = None
+        while rclpy.ok() and self.get_clock().now() < deadline:
+            try:
+                tf = self.tf_buffer.lookup_transform(parent, child, Time())
+                break
+            except Exception:
+                rclpy.spin_once(self, timeout_sec=0.02)
+        if tf is None:
             return None
 
-    # --------- Control ---------
-    def send_arm_traj(self, target_positions: List[float], duration: float = 0.25):
-        """
-        發送 6DOF 關節目標（單點軌跡）
-        """
-        msg = JointTrajectory()
-        msg.joint_names = list(self.joint_names)
-        pt = JointTrajectoryPoint()
-        pt.positions = list(map(float, target_positions))
-        pt.time_from_start = Duration(seconds=max(0.05, float(duration))).to_msg()
-        msg.points = [pt]
-        self.arm_pub.publish(msg)
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        if rpy:
+            r, p, y = _quat_to_euler(q.x, q.y, q.z, q.w)
+            return np.array([t.x, t.y, t.z, r, p, y], dtype=np.float32)
+        else:
+            return np.array([t.x, t.y, t.z, q.x, q.y, q.z, q.w], dtype=np.float32)
 
-    def send_gripper_traj(self, position: float, duration: float = 0.25):
-        """
-        發送夾爪目標（單點）
-        """
-        msg = JointTrajectory()
-        msg.joint_names = [self.gripper_joint_name]
-        pt = JointTrajectoryPoint()
-        pt.positions = [float(position)]
-        pt.time_from_start = Duration(seconds=max(0.05, float(duration))).to_msg()
-        msg.points = [pt]
-        self.grip_pub.publish(msg)
+    # ------------------------------------------------------------------
+    # Camera image
+    # ------------------------------------------------------------------
+    def _ensure_image_sub(self) -> None:
+        if self._sub_img is not None:
+            return
+        topic = self._select_camera_topic()
+        self._camera_topic = topic
+        try:
+            self._sub_img = self.create_subscription(Image, topic, self._on_image, 10)
+            self.get_logger().info(f"Subscribed to camera topic: {topic}")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to subscribe camera topic '{topic}': {e}")
+            self._sub_img = None
 
-    def get_image(self, fill_if_none: bool = True) -> Optional[np.ndarray]:
-        if self._last_image is None and fill_if_none:
-            return np.zeros((self._image_h, self._image_w, 3), dtype=np.uint8)
-        return self._last_image
+    def _select_camera_topic(self) -> str:
+        # Priority: env var / cfg provided
+        if self._camera_topic:
+            return self._camera_topic
+        # Prefer known names if available
+        preferred = ['/top_camera/image_raw', '/camera/image_raw']
+        topics = dict(self.get_topic_names_and_types())
+        for cand in preferred:
+            tys = topics.get(cand, [])
+            if any('sensor_msgs/msg/Image' in t for t in tys):
+                return cand
+        # Otherwise, pick any Image topic
+        for name, tys in topics.items():
+            if any('sensor_msgs/msg/Image' in t for t in tys):
+                return name
+        # Fallback (may or may not exist)
+        return '/top_camera/image_raw'
+
+    def _on_image(self, msg: Image) -> None:
+        with self._img_lock:
+            self._img_msg = msg
+            try:
+                arr = _rosimg_to_numpy_rgb(msg)
+                self._img_np = arr
+                self._img_hwh = (arr.shape[0], arr.shape[1], arr.shape[2])
+            except Exception:
+                # keep last good _img_np
+                pass
+
+    def get_image(self, timeout: float = 0.5, fill_if_none: bool = False) -> Optional[np.ndarray]:
+        """Return last RGB image as np.uint8 [H,W,3]. If none yet, wait up to timeout.
+        If still none and fill_if_none=True, return zero image (640x480x3 default)."""
+        self._ensure_image_sub()
+        deadline = self.get_clock().now() + Duration(seconds=float(timeout))
+        while rclpy.ok() and self._img_np is None and self.get_clock().now() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.02)
+        with self._img_lock:
+            if self._img_np is not None:
+                return self._img_np.copy()
+        if fill_if_none:
+            h, w = 480, 640
+            if self._img_hwh is not None:
+                h, w = self._img_hwh[0], self._img_hwh[1]
+            return np.zeros((h, w, 3), dtype=np.uint8)
+        return None
+
+    # ------------------------------------------------------------------
+    # Gazebo link attacher (optional)
+    # ------------------------------------------------------------------
+    def wait_until_ready(self, timeout_sec: float = 3.0) -> None:
+        if self._has_attacher:
+            self._cli_attach.wait_for_service(timeout_sec=timeout_sec)
+            self._cli_detach.wait_for_service(timeout_sec=timeout_sec)
+
+    def attach(self, model1: str, link1: str, model2: str, link2: str, timeout_sec: float = 2.0) -> bool:
+        if not self._has_attacher:
+            self.get_logger().warn('attach() requested but link attacher services not available')
+            return False
+        try:
+            req = AttachLink.Request()
+            req.model1_name = model1
+            req.link1_name = link1
+            req.model2_name = model2
+            req.link2_name = link2
+            future = self._cli_attach.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+            return bool(future.result())
+        except Exception as e:
+            self.get_logger().warn(f'attach() failed: {e}')
+            return False
+
+    def detach(self, model1: str, link1: str, model2: str, link2: str, timeout_sec: float = 2.0) -> bool:
+        if not self._has_attacher:
+            self.get_logger().warn('detach() requested but link attacher services not available')
+            return False
+        try:
+            req = DetachLink.Request()
+            req.model1_name = model1
+            req.link1_name = link1
+            req.model2_name = model2
+            req.link2_name = link2
+            future = self._cli_detach.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+            return bool(future.result())
+        except Exception as e:
+            self.get_logger().warn(f'detach() failed: {e}')
+            return False
+
+
+# ----------------------------------------------------------------------
+# Math & conversion helpers
+# ----------------------------------------------------------------------
+
+def _quat_to_euler(x: float, y: float, z: float, w: float) -> Tuple[float, float, float]:
+    # roll
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+    # pitch
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1:
+        pitch = np.pi / 2 * np.sign(sinp)
+    else:
+        pitch = np.arcsin(sinp)
+    # yaw
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+    return float(roll), float(pitch), float(yaw)
+
+
+def _rosimg_to_numpy_rgb(msg: Image) -> np.ndarray:
+    h, w = int(msg.height), int(msg.width)
+    enc = (msg.encoding or '').lower()
+    buf = np.frombuffer(msg.data, dtype=np.uint8)
+
+    if enc in ('rgb8', 'rgb_8'):
+        arr = buf.reshape(h, w, 3)
+        return arr
+    if enc in ('bgr8', 'bgr_8'):
+        arr = buf.reshape(h, w, 3)
+        return arr[..., ::-1]  # BGR -> RGB
+    if enc in ('rgba8', 'rgba_8'):
+        arr = buf.reshape(h, w, 4)
+        return arr[..., :3]
+    if enc in ('bgra8', 'bgra_8'):
+        arr = buf.reshape(h, w, 4)
+        arr = arr[..., :3]
+        return arr[..., ::-1]  # BGR -> RGB
+
+    # Fallback: try 3 channels
+    try:
+        arr = buf.reshape(h, w, 3)
+        return arr
+    except Exception:
+        # Last resort: zeros
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+
+__all__ = [
+    'RosHelpers',
+    'RosConfig',
+]
