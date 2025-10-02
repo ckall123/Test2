@@ -1,1 +1,0 @@
-from control.ik import solve_ik
