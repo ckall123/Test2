@@ -1,132 +1,192 @@
-# object/spawner.py
-import uuid
 import random
+from pathlib import Path
+from typing import List, Dict, Optional
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from gazebo_msgs.srv import SpawnEntity, DeleteEntity
-from typing import List, Tuple, Optional
+from geometry_msgs.msg import Pose
 
-# 桌面生成範圍
+# 桌面範圍
 X_RANGE = [-1.05, 0.45]
 Y_RANGE = [-1.20, -0.40]
 Z_HEIGHT = 1.015
 
-# 機械臂佔用空間，避免生成在該範圍內
+# 機械臂佔用區域
 ARM_X = (-0.45, -0.11)
 ARM_Y = (-0.67, -0.26)
 
+DEFAULT_MODELS = ["coke_can", "wood_cube_5cm"]
 
-DEFAULT_MODELS = ["coke_can"]
-# DEFAULT_MODELS = ["beer", "coke_can", "wood_cube_2_5cm", "wood_cube_5cm", "wood_cube_7_5cm"]
-# DEFAULT_MODELS = ["beer", "bowl", "wood_cube_2_5cm", "wood_cube_5cm", "wood_cube_7_5cm", "plastic_cup","coke_can", round_tin_base, round_tin_top ]
+# base_link 在 world 座標下的位置與旋轉（手動量測）
+BASE_X = -0.200000
+BASE_Y = -0.500001
+BASE_Z = 1.020995
+BASE_ROLL = -0.000003
+BASE_PITCH = 0.0
+BASE_YAW = 1.571000
+
+USE_TF = False  # 不使用 TF2，改手動計算
 
 class Spawner(Node):
-    """
-    隨機物件生成器，用於 Gazebo 模擬器：
-    - spawn_random_objects: 隨機生成多個物件，避免重疊與手臂碰撞區。
-    - delete_object / delete_all: 清除指定或所有生成的物件。
-    """
-
-    def __init__(self, object_names: Optional[List[str]] = None):
-        super().__init__(f"spawner_node_{uuid.uuid4().hex[:6]}")
-
-        self.spawn_cli = self.create_client(SpawnEntity, "/spawn_entity")
-        self.delete_cli = self.create_client(DeleteEntity, "/delete_entity")
-        self.object_names = object_names or DEFAULT_MODELS
+    def __init__(self, models: Optional[List[str]] = None):
+        super().__init__('spawner_node')
+        self.cli_spawn = self.create_client(SpawnEntity, '/spawn_entity')
+        self.cli_delete = self.create_client(DeleteEntity, '/delete_entity')
+        self.object_names = models or DEFAULT_MODELS
         self.spawned_names: List[str] = []
 
         for _ in range(5):
-            if self.spawn_cli.wait_for_service(timeout_sec=1.0) and self.delete_cli.wait_for_service(timeout_sec=1.0):
+            if self.cli_spawn.wait_for_service(timeout_sec=1.0) and self.cli_delete.wait_for_service(timeout_sec=1.0):
                 break
-
-    def delete_object(self, name: str) -> bool:
-        req = DeleteEntity.Request(name=name)
-        future = self.delete_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
-        if name in self.spawned_names:
-            self.spawned_names.remove(name)
-        return future.done() and not future.exception()
 
     def delete_all(self):
         for name in self.spawned_names[:]:
-            self.delete_object(name)
+            self.delete(name)
         self.spawned_names.clear()
 
-    def _random_position(self, placed: List[np.ndarray], min_dist: float = 0.08) -> np.ndarray:
-        for _ in range(100):
-            x = random.uniform(*X_RANGE)
-            y = random.uniform(*Y_RANGE)
-            if ARM_X[0] <= x <= ARM_X[1] and ARM_Y[0] <= y <= ARM_Y[1]:
-                continue
-            pos = np.array([x, y, Z_HEIGHT], dtype=np.float32)
-            if all(np.linalg.norm(pos[:2] - p[:2]) >= min_dist for p in placed):
-                return pos
-        return np.array([X_RANGE[0], Y_RANGE[0], Z_HEIGHT], dtype=np.float32)
+    def delete(self, name: str):
+        req = DeleteEntity.Request()
+        req.name = name
+        self.cli_delete.call_async(req)
 
-    def _spawn(self, model: str, position: np.ndarray, name: Optional[str] = None) -> Optional[str]:
-        instance = name or f"{model}_{uuid.uuid4().hex[:6]}"
+    def _is_valid(self, x: float, y: float) -> bool:
+        return not (ARM_X[0] <= x <= ARM_X[1] and ARM_Y[0] <= y <= ARM_Y[1])
+
+    def spawn_model(self, unique_name: str, model_name: str, pose: Pose):
+        model_path = Path.home() / '.gazebo' / 'models' / model_name / 'model.sdf'
+        if not model_path.exists():
+            self.get_logger().error(f'Model file not found: {model_path}')
+            return False
+
+        xml_string = model_path.read_text()
+
         req = SpawnEntity.Request()
-        req.name = instance
-        req.xml = f"""
-        <sdf version='1.6'>
-          <model name='{instance}'>
-            <include>
-              <uri>model://{model}</uri>
-            </include>
-          </model>
-        </sdf>"""
-        req.robot_namespace = instance
-        req.initial_pose.position.x = float(position[0])
-        req.initial_pose.position.y = float(position[1])
-        req.initial_pose.position.z = float(position[2])
-        req.initial_pose.orientation.w = 1.0
+        req.name = unique_name
+        req.xml = xml_string
+        req.initial_pose = pose
 
-        future = self.spawn_cli.call_async(req)
+        future = self.cli_spawn.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
         success = future.done() and not future.exception() and future.result().success
         if success:
-            self.spawned_names.append(instance)
-            return instance
-        return None
+            self.spawned_names.append(unique_name)
+            self.register_in_moveit(unique_name, pose.position.x, pose.position.y, pose.position.z)
+            self.get_logger().info(f"✅ Spawned {unique_name} at ({pose.position.x:.2f}, {pose.position.y:.2f})")
+            return True
+        else:
+            self.get_logger().warn(f"⚠️ Failed to spawn {unique_name}")
+            return False
 
-    def spawn_random_objects(self, count: int, avoid_dist: float = 0.08, unique: bool = True) -> List[Tuple[str, np.ndarray]]:
-        models = self.object_names.copy()
-        if unique and count > len(models):
-            self.get_logger().warn("要求數量超過可用模型數，將進行裁剪。")
-            count = len(models)
+    def spawn_random_objects(self, count: int = 1) -> List[Dict]:
+        name_counts = {}
+        spawned_info = []
 
-        bases = random.sample(models, count) if unique else [random.choice(models) for _ in range(count)]
-        results = []
-        placed = []
+        for _ in range(count):
+            model = random.choice(self.object_names)
+            name_counts[model] = name_counts.get(model, 0) + 1
+            suffix = f"_{name_counts[model]}" if name_counts[model] > 1 else "_1"
+            unique_name = f"{model}{suffix}"
 
-        for model in bases:
-            pos = self._random_position(placed, min_dist=avoid_dist)
-            name = self._spawn(model, pos)
-            if name:
-                results.append((name, pos))
-                placed.append(pos)
+            for _ in range(100):
+                x = random.uniform(*X_RANGE)
+                y = random.uniform(*Y_RANGE)
+                if self._is_valid(x, y):
+                    break
+            else:
+                self.get_logger().warn(f"找不到有效位置給 {unique_name}，跳過。")
+                continue
 
-        return results
+            pose = Pose()
+            pose.position.x = x
+            pose.position.y = y
+            pose.position.z = Z_HEIGHT
+
+            if self.spawn_model(unique_name, model, pose):
+                spawned_info.append({
+                    "name": unique_name,
+                    "model": model,
+                    "pose": pose
+                })
+
+        return spawned_info
+
+    def register_in_moveit(self, name: str, x: float, y: float, z: float):
+        from moveit_msgs.msg import CollisionObject, PlanningScene
+        from moveit_msgs.srv import ApplyPlanningScene
+        from shape_msgs.msg import SolidPrimitive
+        from geometry_msgs.msg import PoseStamped
+        from std_msgs.msg import Header
+        import math
+
+        client = self.create_client(ApplyPlanningScene, '/apply_planning_scene')
+        while not client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('等待 /apply_planning_scene 服務中...')
+
+        obj = CollisionObject()
+        obj.id = name
+        obj.header = Header(frame_id='link_base')
+
+        if USE_TF:
+            # 使用 TF2（略）
+            pass
+        else:
+            # 手動轉換 world -> link_base
+            t = np.array([BASE_X, BASE_Y, BASE_Z])
+            cy = math.cos(BASE_YAW)
+            sy = math.sin(BASE_YAW)
+            cp = math.cos(BASE_PITCH)
+            sp = math.sin(BASE_PITCH)
+            cr = math.cos(BASE_ROLL)
+            sr = math.sin(BASE_ROLL)
+
+            R = np.array([
+                [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+                [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+                [-sp, cp*sr, cp*cr]
+            ])
+            p_world = np.array([x, y, z])
+            p_base = R.T @ (p_world - t)
+
+        primitive = SolidPrimitive()
+        primitive.type = SolidPrimitive.BOX
+        primitive.dimensions = [0.05, 0.05, 0.15]
+
+        pose = PoseStamped()
+        pose.header = obj.header
+        pose.pose.position.x = float(p_base[0])
+        pose.pose.position.y = float(p_base[1])
+        pose.pose.position.z = float(p_base[2] + 0.075)
+        pose.pose.orientation.w = 1.0
+
+        obj.primitives.append(primitive)
+        obj.primitive_poses.append(pose.pose)
+        obj.operation = CollisionObject.ADD
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.world.collision_objects.append(obj)
+
+        req = ApplyPlanningScene.Request(scene=scene)
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        result = future.result()
+        if result and result.success:
+            self.get_logger().info(f"📦 MoveIt collision added in link_base at ({p_base[0]:.3f}, {p_base[1]:.3f}, {p_base[2]+0.075:.3f}) from world [manual={not USE_TF}]")
+        else:
+            self.get_logger().error(f"❌ Failed to add collision object: {name}")
 
 
-# 測試：生成 3 個隨機物件並在 10 秒後刪除
 if __name__ == '__main__':
-    import time
-
     rclpy.init()
     spawner = Spawner()
-
     try:
-        print("🎯 嘗試生成 3 個物件...")
-        objects = spawner.spawn_random_objects(count=1)
-        for name, pos in objects:
-            print(f"✅ 已生成: {name} at {pos.round(3).tolist()}")
-
-        # time.sleep(10)  # 等一下，讓你看看物件
-        # print("🧹 開始刪除所有生成的物件...")
-        # spawner.delete_all()
-
+        spawner.get_logger().info("🎯 嘗試生成 3 個物件...")
+        objects = spawner.spawn_random_objects(count=3)
+        for obj in objects:
+            print(f"已生成: {obj['name']} model={obj['model']} at "
+                  f"(world)({obj['pose'].position.x:.2f},{obj['pose'].position.y:.2f},{obj['pose'].position.z:.2f})")
     finally:
         spawner.destroy_node()
         rclpy.shutdown()
