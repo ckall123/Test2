@@ -6,6 +6,8 @@ import numpy as np
 from geometry_msgs.msg import Pose
 from gazebo_msgs.srv import SpawnEntity, DeleteEntity
 
+from collision_object import CollisionObjectManager
+
 # 桌面範圍
 X_RANGE = [-1.05, 0.45]
 Y_RANGE = [-1.20, -0.40]
@@ -37,6 +39,8 @@ class Spawner:
         self.object_names = models or DEFAULT_MODELS
         self.spawned_names: List[str] = []
 
+        self.moveit_manager = CollisionObjectManager(node, executor)
+
         for _ in range(5):
             if self.cli_spawn.wait_for_service(timeout_sec=1.0) and self.cli_delete.wait_for_service(timeout_sec=1.0):
                 break
@@ -50,6 +54,7 @@ class Spawner:
         req = DeleteEntity.Request()
         req.name = name
         self.cli_delete.call_async(req)
+        self.moveit_manager.remove(name)
 
     def _is_valid(self, x: float, y: float) -> bool:
         return not (ARM_X[0] <= x <= ARM_X[1] and ARM_Y[0] <= y <= ARM_Y[1])
@@ -105,29 +110,20 @@ class Spawner:
             pose.position.z = Z_HEIGHT
 
             if self.spawn_model(unique_name, model, pose):
-                spawned_info.append({
+                info = {
                     "name": unique_name,
                     "model": model,
                     "pose": pose
-                })
+                }
+                spawned_info.append(info)
+                self.node.get_logger().info(
+                    f"已生成: {info['name']} model={info['model']} at (world)({info['pose'].position.x:.2f},{info['pose'].position.y:.2f},{info['pose'].position.z:.2f})"
+                )
 
         return spawned_info
 
     def register_in_moveit(self, name: str, x: float, y: float, z: float):
-        from moveit_msgs.msg import CollisionObject, PlanningScene
-        from moveit_msgs.srv import ApplyPlanningScene
-        from shape_msgs.msg import SolidPrimitive
-        from geometry_msgs.msg import PoseStamped
-        from std_msgs.msg import Header
         import math
-
-        client = self.node.create_client(ApplyPlanningScene, '/apply_planning_scene')
-        while not client.wait_for_service(timeout_sec=1.0):
-            self.node.get_logger().info('等待 /apply_planning_scene 服務中...')
-
-        obj = CollisionObject()
-        obj.id = name
-        obj.header = Header(frame_id='link_base')
 
         if USE_TF:
             pass
@@ -148,36 +144,13 @@ class Spawner:
             p_world = np.array([x, y, z])
             p_base = R.T @ (p_world - t)
 
-        primitive = SolidPrimitive()
-        primitive.type = SolidPrimitive.BOX
-        primitive.dimensions = [0.05, 0.05, 0.15]
+        pose = Pose()
+        pose.position.x = float(p_base[0])
+        pose.position.y = float(p_base[1])
+        pose.position.z = float(p_base[2] + 0.075)
+        pose.orientation.w = 1.0
 
-        pose = PoseStamped()
-        pose.header = obj.header
-        pose.pose.position.x = float(p_base[0])
-        pose.pose.position.y = float(p_base[1])
-        pose.pose.position.z = float(p_base[2] + 0.075)
-        pose.pose.orientation.w = 1.0
-
-        obj.primitives.append(primitive)
-        obj.primitive_poses.append(pose.pose)
-        obj.operation = CollisionObject.ADD
-
-        scene = PlanningScene()
-        scene.is_diff = True
-        scene.world.collision_objects.append(obj)
-
-        req = ApplyPlanningScene.Request(scene=scene)
-        future = client.call_async(req)
-        self.executor.spin_until_future_complete(future)
-
-        result = future.result()
-        if result and result.success:
-            self.node.get_logger().info(
-                f"📦 MoveIt collision added in link_base at ({p_base[0]:.3f}, {p_base[1]:.3f}, {p_base[2]+0.075:.3f}) from world [manual={not USE_TF}]"
-            )
-        else:
-            self.node.get_logger().error(f"❌ Failed to add collision object: {name}")
+        self.moveit_manager.add_box(name, pose, size=(0.05, 0.05, 0.15))
 
 
 if __name__ == '__main__':
@@ -194,12 +167,11 @@ if __name__ == '__main__':
 
     try:
         node.get_logger().info("🎯 嘗試生成 3 個物件...")
-        objects = spawner.spawn_random_objects(count=3)
-        for obj in objects:
-            print(f"已生成: {obj['name']} model={obj['model']} at "
-                  f"(world)({obj['pose'].position.x:.2f},{obj['pose'].position.y:.2f},{obj['pose'].position.z:.2f})")
+        spawner.spawn_random_objects(count=3)
+        input("🔍 按下 Enter 鍵測試刪除這些物件...\n")
+        spawner.delete_all()
+
     finally:
         node.destroy_node()
         rclpy.shutdown()
         print("🛑 測試結束")
-

@@ -9,15 +9,14 @@ import utils
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
-import threading
 
+from collision_object import setup_collision_objects
 
 def make_env(node: Node, executor: MultiThreadedExecutor) -> XArm6Env:
     cfg = utils.EnvConfig()
     env = XArm6Env(node, executor, cfg)
     check_env(env, warn=True)
     return env
-
 
 def train():
     if not rclpy.ok():
@@ -27,9 +26,8 @@ def train():
     node = Node("train_node")
     executor.add_node(node)
 
-    # ⚠️ 不要再啟 spin_thread
-    # spin_thread = threading.Thread(target=executor.spin, daemon=True)
-    # spin_thread.start()
+    # 初始化桌面碰撞物件（idempotent、安全）
+    setup_collision_objects(node, executor)
 
     try:
         env = make_env(node, executor)
@@ -43,8 +41,6 @@ def train():
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
-
 
 if __name__ == "__main__":
     train()
