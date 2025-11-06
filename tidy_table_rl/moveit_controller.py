@@ -1,4 +1,4 @@
-# ✅ MoveIt Controller v2 - With Exposed Limits + Fast Fallback Planning
+# ✅ MoveIt Controller v2 - With Exposed Limits + Fast Fallback Planning (fixed)
 
 import math
 import threading
@@ -56,14 +56,15 @@ class MoveItController:
     def _joint_state_callback(self, msg: JointState):
         with self._joint_state_lock:
             for name, pos in zip(msg.name, msg.position):
-                self._joint_state_map[name] = pos
+                self._joint_state_map[name] = float(pos)  # ✅ 原生 float
             self._joint_state_ready = True
 
     def _wait_joint_state(self, timeout_sec=2.0):
         import time
         start = time.time()
-        while not self._joint_state_ready and time.time() - start < timeout_sec:
-            rclpy.spin_once(self.node, timeout_sec=0.1)
+        while (not self._joint_state_ready) and (time.time() - start < timeout_sec):
+            # ✅ 用同一個 executor spin，避免卡死
+            self.executor.spin_once(timeout_sec=0.1)
         if not self._joint_state_ready:
             raise RuntimeError("❌ joint_states timeout. Check if controller is publishing.")
 
@@ -73,56 +74,62 @@ class MoveItController:
             return np.array([self._joint_state_map.get(name, 0.0) for name in self.joint_names], dtype=np.float32)
 
     def get_joint_velocities(self) -> np.ndarray:
+        # NOTE: JointState.velocities 與 names 對齊，這裡保守回 0
         self._wait_joint_state()
         with self._joint_state_lock:
-            # Use velocity if available, else return zeros
-            return np.array([self._joint_state_map.get(name + '_velocity', 0.0) for name in self.joint_names], dtype=np.float32)
+            return np.zeros(6, dtype=np.float32)
 
     def get_gripper_state(self) -> float:
         self._wait_joint_state()
         with self._joint_state_lock:
-            pos = self._joint_state_map.get(GRIPPER_JOINT_NAME, GRIPPER_MIN)
+            pos = float(self._joint_state_map.get(GRIPPER_JOINT_NAME, GRIPPER_MIN))
             norm = (pos - GRIPPER_MIN) / (GRIPPER_MAX - GRIPPER_MIN)
             return float(np.clip(norm, 0.0, 1.0))
 
     def move_arm(self, joint_positions: List[float], timeout: float = 1.0) -> Tuple[bool, str]:
+        # ✅ 入口就落地為 Python float list，避免 numpy.float32
+        if isinstance(joint_positions, np.ndarray):
+            joint_positions = joint_positions.astype(float).tolist()
+        else:
+            joint_positions = [float(x) for x in joint_positions]
+
         if len(joint_positions) != len(self.joint_names):
             return False, "❌ Invalid joint count"
 
         goal = MoveGroup.Goal()
         goal.request.group_name = 'xarm6'
-        goal.request.allowed_planning_time = timeout  # ✅ fast fallback
+        goal.request.allowed_planning_time = float(timeout)  # ✅ float
 
         constraint = Constraints()
         for i, (name, pos) in enumerate(zip(self.joint_names, joint_positions)):
-            min_limit, max_limit = self.joint_limits[i]
-            pos = np.clip(pos, min_limit, max_limit)
+            min_limit, max_limit = float(self.joint_limits[i, 0]), float(self.joint_limits[i, 1])
+            pos = float(np.clip(pos, min_limit, max_limit))  # ✅ float
 
             jc = JointConstraint()
             jc.joint_name = name
-            jc.position = pos
-            jc.tolerance_above = 0.01
-            jc.tolerance_below = 0.01
-            jc.weight = 1.0
+            jc.position = float(pos)           # ✅ 必須是原生 float
+            jc.tolerance_above = float(0.01)
+            jc.tolerance_below = float(0.01)
+            jc.weight = float(1.0)
             constraint.joint_constraints.append(jc)
 
         goal.request.goal_constraints.append(constraint)
         return self._send_goal_blocking(goal, 'arm')
 
     def move_gripper(self, position: float, timeout: float = 1.0) -> Tuple[bool, str]:
-        pos = np.clip(position, GRIPPER_MIN, GRIPPER_MAX)
+        pos = float(np.clip(float(position), GRIPPER_MIN, GRIPPER_MAX))  # ✅ float
 
         goal = MoveGroup.Goal()
         goal.request.group_name = 'xarm_gripper'
-        goal.request.allowed_planning_time = timeout
+        goal.request.allowed_planning_time = float(timeout)
 
         constraint = Constraints()
         jc = JointConstraint()
         jc.joint_name = GRIPPER_JOINT_NAME
-        jc.position = pos
-        jc.tolerance_above = 0.01
-        jc.tolerance_below = 0.01
-        jc.weight = 1.0
+        jc.position = float(pos)               # ✅ 必須是原生 float
+        jc.tolerance_above = float(0.01)
+        jc.tolerance_below = float(0.01)
+        jc.weight = float(1.0)
         constraint.joint_constraints.append(jc)
 
         goal.request.goal_constraints.append(constraint)
@@ -132,12 +139,11 @@ class MoveItController:
         success, msg = self.move_arm(joint_goal, timeout)
         if not success:
             return False, msg
-
         return self.move_gripper(gripper_cmd, timeout)
 
     def go_home(self) -> Tuple[bool, str]:
         home_joints = [0.0] * 6
-        return self.plan_and_execute(home_joints, 0.0)
+        return self.plan_and_execute(home_joints, float(0.0))
 
     def _send_goal_blocking(self, goal_msg, desc: str) -> Tuple[bool, str]:
         self.client.wait_for_server()
@@ -165,7 +171,7 @@ if __name__ == '__main__':
     executor.add_node(node)
 
     controller = MoveItController(node, executor)
-    target = [math.radians(90), math.radians(-118), math.radians(0), 0.0, math.radians(45), 0.0]
+    target = [math.radians(90), math.radians(-50), math.radians(20), 0.0, math.radians(45), 0.0]
     success, msg = controller.plan_and_execute(target, 0.85)
 
     log = node.get_logger()

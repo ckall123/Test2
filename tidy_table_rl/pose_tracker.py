@@ -32,8 +32,9 @@ def _quat_to_yaw(qx, qy, qz, qw):
 
 
 class PoseTracker:
-    def __init__(self, node: Node, base_extrinsic: BaseExtrinsic = None):
+    def __init__(self, node: Node, executor, base_extrinsic: BaseExtrinsic = None):
         self.node = node
+        self.executor = executor  # ✅ 使用同一個 executor
         self.base_ext = base_extrinsic or BaseExtrinsic()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, node)
@@ -48,14 +49,13 @@ class PoseTracker:
                 time=rclpy.time.Time(),
                 timeout=Duration(seconds=0.5)
             )
-        except:
+        except Exception:
             return None
 
     def get_tcp_pose(self, tcp_frame: str = "link_tcp") -> tuple[np.ndarray, float] | None:
         tf = self._get_tf_position("link_base", tcp_frame)
         if tf is None:
             return None
-
         t = tf.transform.translation
         pos_world = self.base_ext.base_to_world(np.array([t.x, t.y, t.z]))
         q = tf.transform.rotation
@@ -68,7 +68,7 @@ class PoseTracker:
         req = GetEntityState.Request()
         req.name = name
         future = self.client.call_async(req)
-        rclpy.spin_until_future_complete(self.node, future)
+        self.executor.spin_until_future_complete(future)  # ✅ 用 executor
         if future.result() and future.result().success:
             p = future.result().state.pose.position
             return np.array([p.x, p.y, p.z])
@@ -78,7 +78,7 @@ class PoseTracker:
         req = GetEntityState.Request()
         req.name = name
         future = self.client.call_async(req)
-        rclpy.spin_until_future_complete(self.node, future)
+        self.executor.spin_until_future_complete(future)  # ✅ 用 executor
         if future.result() and future.result().success:
             o = future.result().state.pose.orientation
             return _quat_to_yaw(o.x, o.y, o.z, o.w)
@@ -95,7 +95,7 @@ class PoseTracker:
             req = GetEntityState.Request()
             req.name = name
             future = self.client.call_async(req)
-            rclpy.spin_until_future_complete(self.node, future)
+            self.executor.spin_until_future_complete(future)  # ✅ 用 executor
             if future.result() and future.result().success:
                 p = future.result().state.pose.position
                 o = future.result().state.pose.orientation
@@ -107,14 +107,6 @@ class PoseTracker:
                 })
         return results
 
-    def get_distances(self, object_names: list[str], tcp_frame: str = "link_tcp") -> dict:
-        tcp_pose = self.get_tcp_pose(tcp_frame)
-        tcp_pos = tcp_pose[0] if tcp_pose else None
-        return {
-            name: float(np.linalg.norm(tcp_pos - pos)) if (pos := self.get_object_pose_world(name)) is not None and tcp_pos is not None else float('inf')
-            for name in object_names
-        }
-
 
 def load_target_names(path="config.json") -> list[str]:
     with open(path) as f:
@@ -125,13 +117,15 @@ def load_target_names(path="config.json") -> list[str]:
 if __name__ == "__main__":
     rclpy.init()
     node = rclpy.create_node("pose_tracker_test")
-    tracker = PoseTracker(node)
+    executor = rclpy.executors.SingleThreadedExecutor()   # ✅ 新增
+    executor.add_node(node)                                # ✅ 新增
+    tracker = PoseTracker(node, executor)                  # ✅ 傳 executor
     targets = load_target_names()
 
     for _ in range(50):
         if tracker.get_tcp_pose() is not None:
             break
-        rclpy.spin_once(node, timeout_sec=0.1)
+        executor.spin_once(timeout_sec=0.1)                # ✅ 用 executor
 
     while rclpy.ok():
         tcp = tracker.get_tcp_pose()
@@ -139,11 +133,7 @@ if __name__ == "__main__":
             print(f"🔹 TCP: pos={tcp[0]}, yaw={tcp[1]:.3f}")
         for o in tracker.get_object_states(targets):
             print(f"🔸 {o['name']}: pos={o['pos']}, yaw={o['yaw']:.3f}, radius={o['radius']:.2f}")
-        for name, d in tracker.get_distances(targets).items():
-            print(f"📏 {name}: {d:.4f}m")
-        print("-----------")
-        for _ in range(10):
-            rclpy.spin_once(node, timeout_sec=0.1)
+        executor.spin_once(timeout_sec=0.1)                # ✅ 用 executor
 
     node.destroy_node()
     rclpy.shutdown()
