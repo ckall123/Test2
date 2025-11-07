@@ -36,6 +36,7 @@ from buffers import ReplayBuffer, ImageBuffer, PreferenceDataset
 from reward import RewardModel, pairwise_loss, preprocess_image
 from relabel import relabel_transitions
 from vlm import VLMScorer
+from collision_object import CollisionObjectManager
 
 
 # ========= 超參（可依需求調整） =========
@@ -82,6 +83,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     node.get_logger().info(f"🚀 Device: {device}")
 
+    CollisionObjectManager.default_setup(node, executor)
+
     try:
         # ===== 2) Env / Agent / Buffers / Models =====
         env_cfg = XArmEnvConfig()
@@ -97,7 +100,7 @@ def main():
             buffer_size=100_000,
             train_freq=(1, "step"),
             gradient_steps=1,
-            batch_size=256,
+            batch_size=32,
             ent_coef="auto"
         )
 

@@ -27,6 +27,9 @@ class CollisionObjectManager:
         req = ApplyPlanningScene.Request(scene=scene)
         future = self.cli.call_async(req)
         self.executor.spin_until_future_complete(future)
+        res = future.result()
+        if not res or not res.success:
+            self.node.get_logger().warn("❌ ApplyPlanningScene failed")
 
     def add_table(self, name: str, pose: Pose, size=(0.6, 1.2, 0.75)):
         self._add_box(name, pose, size)
@@ -67,19 +70,17 @@ class CollisionObjectManager:
         req = ApplyPlanningScene.Request(scene=scene)
         future = self.cli.call_async(req)
         self.executor.spin_until_future_complete(future)
+        res = future.result()
+        if not res or not res.success:
+            self.node.get_logger().warn(f"⚠️ Timeout removing {name}")
 
     def clear(self):
-        for obj in self.objects:
+        for obj in list(self.objects):
             self.remove(obj.id)
         self.objects.clear()
 
     @classmethod
-    def default_setup(cls) -> "CollisionObjectManager":
-        rclpy.init()
-        executor = SingleThreadedExecutor()
-        node = rclpy.create_node("collision_object_node")
-        executor.add_node(node)
-
+    def default_setup(cls, node: Node, executor: SingleThreadedExecutor) -> "CollisionObjectManager":
         manager = cls(node, executor)
 
         pose = Pose()
@@ -93,11 +94,18 @@ class CollisionObjectManager:
 
     def shutdown(self):
         self.node.destroy_node()
-        rclpy.shutdown()
 
 
 if __name__ == '__main__':
-    manager = CollisionObjectManager.default_setup()
+    rclpy.init()
+    executor = SingleThreadedExecutor()
+    node = rclpy.create_node("collision_object_node")
+    executor.add_node(node)
+
+    manager = CollisionObjectManager.default_setup(node, executor)
+    node.get_logger().info("✅ CollisionObjectManager ready.")
+
     input("🛠️ Enter 鍵以清除並結束...")
     manager.clear()
     manager.shutdown()
+    rclpy.shutdown()

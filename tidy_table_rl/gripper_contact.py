@@ -69,8 +69,9 @@ class ContactMonitor:
         self._contact_history.clear()
 
     def check_dual_contact(self, keywords: list[str]) -> tuple[bool, str | None]:
-        left_hits = [obj for obj in self.left_finger.contacts if any(k in obj for k in keywords)]
-        right_hits = [obj for obj in self.right_finger.contacts if any(k in obj for k in keywords)]
+        kw = [k for k in keywords if isinstance(k, str) and k]  # 防呆
+        left_hits  = [obj for obj in self.left_finger.contacts  if any(k in obj for k in kw)]
+        right_hits = [obj for obj in self.right_finger.contacts if any(k in obj for k in kw)]
         shared = list(set(left_hits) & set(right_hits))
         both_touching = self.left_finger.has_contact and self.right_finger.has_contact
         return (True, shared[0]) if shared and both_touching else (False, None)

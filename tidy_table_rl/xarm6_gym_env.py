@@ -6,6 +6,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple
+import time
 
 from camera import TopDownCamera
 from moveit_controller import MoveItController, ARM_JOINT_NAMES
@@ -105,21 +106,30 @@ class XArm6Env(gym.Env):
 
         self.node.get_logger().info("🤩 Respawning tabletop objects…")
         self.spawner.delete_all()
-        self.spawner.spawn_random_objects(count=self.k_objects)
-        all_names = load_target_names()
-        true_names = all_names[:self.k_objects]
-        if len(true_names) < self.k_objects:
-            self.node.get_logger().warn(f"⚠️ Tracker 可用物件數量不足: got {len(true_names)} / need {self.k_objects}")
-        self.object_names = true_names + [None] * (self.k_objects - len(true_names))
+        time.sleep(0.8)
 
-        query_names = [n for n in self.object_names if n is not None]
-        for i in range(60):
-            objs = self.tracker.get_object_states(query_names)
-            if len(objs) >= len(query_names):
+        spawned = self.spawner.spawn_random_objects(count=self.k_objects)
+        time.sleep(0.6)
+
+        self.object_names = [o["name"] for o in spawned if isinstance(o, dict) and o.get("name")]
+
+        target = len(self.object_names)
+        start = time.time()
+        got = 0
+        for _ in range(200):
+            states = self.tracker.get_object_states(self.object_names)
+            got = len(states)
+            self.node.get_logger().info(f"⏳ Waiting tracker... got {got}/{target}")
+            if got >= target:
                 break
-            if i % 10 == 0:
-                self.node.get_logger().info(f"⏳ Waiting tracker... got {len(objs)}/{len(query_names)}")
-            self.executor.spin_once(timeout_sec=0.1)
+            time.sleep(0.05)
+
+        ready = (got >= target)
+        elapsed = time.time() - start
+        if ready:
+            self.node.get_logger().info(f"✅ Tracker ready: {got}/{target} in {elapsed:.2f}s")
+        else:
+            self.node.get_logger().warn(f"❌ Tracker timeout: {got}/{target} after {elapsed:.2f}s")
 
         self.controller.go_home()
         self.controller.move_gripper(GRIPPER_MAX)
@@ -142,13 +152,13 @@ class XArm6Env(gym.Env):
         q_tar = q_now + dq
         q_tar = np.clip(q_tar, self.controller.joint_limits[:, 0], self.controller.joint_limits[:, 1])
         self.controller.plan_and_execute(q_tar, gripper_pos)
-
-        for _ in range(3):
-            self.executor.spin_once(timeout_sec=0.01)
+        # 背景 executor 已由 PoseTracker 自轉，這裡不再手動 spin
+        # time.sleep(0.03)  # 如需微等待可用 sleep 取代
 
         self._hist.add(a)
 
-        contact_ok, candidate = self.contact_monitor.check_dual_contact(self.object_names)
+        safe_names = [n for n in self.object_names if isinstance(n, str) and n]
+        contact_ok, candidate = self.contact_monitor.check_dual_contact(safe_names)
         contact_flag = float(contact_ok)
 
         if self.held_object and grip_cmd < self.cfg.open_thresh:
@@ -179,7 +189,7 @@ class XArm6Env(gym.Env):
         return self._grab_image()
 
     def close(self):
-        self.node.get_logger().info("🪩 Environment closed")
+        self.node.get_logger().info("🎩 Environment closed")
 
     def _grab_image(self) -> np.ndarray:
         return self.camera.get_latest_frame(self.executor)
