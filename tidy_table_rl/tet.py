@@ -1,0 +1,3 @@
+from collision_object import CollisionObjectManager
+
+CollisionObjectManager.default_setup()
